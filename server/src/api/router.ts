@@ -13,8 +13,9 @@ import { isProviderProfileId } from '../agents/computer/provider-profiles.js'
 import { InvalidModelIdError, parseModelId } from '../agents/computer/model-id.js'
 import type { PoolClient } from 'pg'
 import {
-  storage, UPLOAD_DIR, freshenAttachmentUrl, normalizeStorageKey,
+  storage, UPLOAD_DIR, normalizeStorageKey,
   storageKeyFromPublicUrl, messageAttachmentStorageKey,
+  rowAttachments, freshenAttachments, parseMessageAttachments,
 } from '../storage.js'
 import { healthPool, pool } from '../db/pool.js'
 import { CH_MESSAGE_NEW, CH_REACTIONS, CH_CONVO_UPDATED, CH_DOCS, CH_TYPING, CH_CALENDAR_EVENTS, CH_BOARDS, CH_STATUS, CH_WORKSPACES, publish } from '../redis.js'
@@ -1917,13 +1918,12 @@ api.delete('/companies/:id', safe(async (req, res) => {
       const key = row.storage_key ? normalizeStorageKey(row.storage_key) : null
       if (key) storageKeys.add(key)
     }
-    const { rows: messageFiles } = await client.query<{ attachment: unknown }>(
-      `SELECT attachment FROM messages WHERE company_id = $1 AND attachment IS NOT NULL`, [companyId],
+    const { rows: messageFiles } = await client.query<{ attachment: unknown; attachments: unknown }>(
+      `SELECT attachment, attachments FROM messages
+        WHERE company_id = $1 AND (attachment IS NOT NULL OR attachments IS NOT NULL)`, [companyId],
     )
     for (const row of messageFiles) {
-      const candidates = Array.isArray(row.attachment) ? row.attachment : [row.attachment]
-      for (const candidate of candidates) {
-        if (!candidate || typeof candidate !== 'object') continue
+      for (const candidate of rowAttachments(row)) {
         const key = messageAttachmentStorageKey(candidate as { key?: unknown; url?: unknown })
         if (key) storageKeys.add(key)
       }
@@ -3464,6 +3464,7 @@ api.get('/conversations', async (req, res) => {
           'body', m.body,
           'tool', m.tool,
           'attachment', m.attachment,
+          'attachments', m.attachments,
           'createdAt', m.created_at,
           -- For email messages, surface the subject + direction so the
           -- sidebar preview can show "Re: contract draft" instead of a
@@ -3956,7 +3957,7 @@ api.get('/conversations/:id/messages', async (req, res) => {
           m.id, m.conversation_id AS "conversationId",
           m.author_id AS "authorId", m.kind, m.body, m.sequence,
           m.client_id AS "clientId",
-          m.tool, m.attachment, m.poll,
+          m.tool, m.attachment, m.attachments, m.poll,
           -- Per-option vote tallies for polls. Empty array for non-poll
           -- rows. voterIds is sorted so the client can diff cheaply across
           -- successive WS poll.updated events.
@@ -4075,20 +4076,14 @@ api.get('/conversations/:id/messages', async (req, res) => {
     // Re-sign every persisted attachment URL with a fresh expiry so
     // historical messages don't break after the original signature's TTL.
     // No-op for attachments without a stored `key` (legacy local mode).
-    //
-    // A storage-backend hiccup on ONE row used to 500 the whole list —
-    // wrap each refresh so a single bad attachment falls back to its
-    // stored (possibly stale) URL instead of bringing down the response.
+    // `freshenAttachments` catches per-element failures internally (one bad
+    // key must not 500 the list); dual-publish `attachments` (full array)
+    // and `attachment` (first, legacy shape).
     for (const row of rows) {
-      if (!row.attachment) continue
-      try {
-        row.attachment = await freshenAttachmentUrl(row.attachment)
-      } catch (e) {
-        console.warn(
-          `[messages] freshenAttachmentUrl failed for message ${row.id} in ${id}; ` +
-          `falling back to stored URL`, e,
-        )
-      }
+      if (!row.attachment && !row.attachments) continue
+      const list = await freshenAttachments(rowAttachments(row))
+      row.attachments = list.length ? list : null
+      row.attachment = list[0] ?? null
     }
     // Email attachments: same idea, different shape. The SQL JOIN returns
     // each attachment with its storage_key; resolve a fresh public URL so
@@ -4121,38 +4116,21 @@ api.post('/conversations/:id/messages', async (req, res) => {
   const { userId: me, companyId: tenant } = await requireCompany(req)
   const { id } = req.params
   const body = String(req.body?.body ?? '').trim()
-  const rawAttachment = req.body?.attachment
-  let attachment: AttachmentPayload | null = null
-  if (rawAttachment && typeof rawAttachment === 'object') {
-    const a = rawAttachment as Record<string, unknown>
-    if (typeof a.url === 'string' && typeof a.name === 'string') {
-      // URLs are display data and may be client-controlled or expired. Resolve
-      // the server-generated object key, then mint the URL ourselves so a chat
-      // attachment can never turn an agent wake into an arbitrary server fetch.
-      const key = messageAttachmentStorageKey(a)
-      if (!key) {
-        res.status(400).json({ error: 'attachment must reference Cumora storage' })
-        return
-      }
-      let url: string
-      try {
-        url = await storage.publicUrl(key)
-      } catch {
-        res.status(400).json({ error: 'attachment storage reference is invalid' })
-        return
-      }
-      attachment = {
-        url,
-        name: a.name.trim().slice(0, 200),
-        kind: (a.kind === 'pdf' || a.kind === 'file' || a.kind === 'fig' ? a.kind : 'img') as AttachmentPayload['kind'],
-        mime: typeof a.mime === 'string' ? a.mime : undefined,
-        size: typeof a.size === 'number' ? a.size : undefined,
-        key,
-      }
-    }
+  // Dual-accept: new clients send `attachments` (array); old clients send the
+  // singular `attachment`. Storage always keeps the full array plus a legacy
+  // first-element copy in `attachment` (see the INSERT below).
+  const rawAttachments = Array.isArray(req.body?.attachments)
+    ? req.body.attachments
+    : (req.body?.attachment != null ? [req.body.attachment] : [])
+  const parsedAttachments = await parseMessageAttachments(rawAttachments)
+  if ('error' in parsedAttachments) {
+    res.status(400).json({ error: parsedAttachments.error })
+    return
   }
+  const attachments = parsedAttachments.attachments
+  const attachment: AttachmentPayload | null = (attachments[0] as AttachmentPayload | undefined) ?? null
   // Allow empty body when an attachment is present (e.g. user just shares an image)
-  if (!body && !attachment) {
+  if (!body && attachments.length === 0) {
     res.status(400).json({ error: 'empty message' })
     return
   }
@@ -4331,12 +4309,17 @@ api.post('/conversations/:id/messages', async (req, res) => {
     const sequence = seqResult.rows[0]?.seq ?? 1
     const inserted = await client.query<{ id: string; sequence: number }>(
       `INSERT INTO messages
-         (id, conversation_id, author_id, kind, body, sequence, attachment, quoted_message_id, company_id, client_id)
-       VALUES ($1,$2,$3,'text',$4,$5,$6::jsonb,$7,$8,$9)
+         (id, conversation_id, author_id, kind, body, sequence, attachment, attachments, quoted_message_id, company_id, client_id)
+       VALUES ($1,$2,$3,'text',$4,$5,$6::jsonb,$7::jsonb,$8,$9,$10)
        ON CONFLICT (conversation_id, author_id, client_id) WHERE client_id IS NOT NULL
        DO NOTHING
        RETURNING id, sequence`,
-      [proposedMessageId, id, me, body, sequence, attachment ? JSON.stringify(attachment) : null, resolvedQuotedId, tenant, clientId],
+      [
+        proposedMessageId, id, me, body, sequence,
+        attachment ? JSON.stringify(attachment) : null,
+        attachments.length ? JSON.stringify(attachments) : null,
+        resolvedQuotedId, tenant, clientId,
+      ],
     )
     persisted = inserted.rows[0] ?? (clientId
       ? (await client.query<{ id: string; sequence: number }>(
@@ -4360,6 +4343,7 @@ api.post('/conversations/:id/messages', async (req, res) => {
           id: persisted.id, conversationId: id, authorId: me,
           kind: 'text', body, sequence: persisted.sequence, at: new Date().toISOString(),
           attachment: attachment ?? undefined,
+          attachments: attachments.length ? attachments : undefined,
           quotedMessageId: resolvedQuotedId ?? undefined,
           quoted: quotedSummary ?? undefined,
           clientId: clientId ?? undefined,
@@ -4952,7 +4936,7 @@ api.get('/conversations/:id/messages/:rootId/replies', async (req, res) => {
       `SELECT
           m.id, m.conversation_id AS "conversationId",
           m.author_id AS "authorId", m.kind, m.body, m.sequence,
-          m.tool, m.attachment, m.poll,
+          m.tool, m.attachment, m.attachments, m.poll,
           -- Per-option vote tallies for polls. Empty array for non-poll
           -- rows. voterIds is sorted so the client can diff cheaply across
           -- successive WS poll.updated events.
@@ -5016,14 +5000,10 @@ api.get('/conversations/:id/messages/:rootId/replies', async (req, res) => {
       [id, rootId, tenant],
     )
     for (const row of rows) {
-      if (!row.attachment) continue
-      try { row.attachment = await freshenAttachmentUrl(row.attachment) }
-      catch (e) {
-        console.warn(
-          `[replies] freshenAttachmentUrl failed for message ${row.id}; ` +
-          `falling back to stored URL`, e,
-        )
-      }
+      if (!row.attachment && !row.attachments) continue
+      const list = await freshenAttachments(rowAttachments(row))
+      row.attachments = list.length ? list : null
+      row.attachment = list[0] ?? null
     }
     res.json(rows)
   } catch (e) {

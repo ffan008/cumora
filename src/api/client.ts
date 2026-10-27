@@ -167,6 +167,7 @@ export interface ApiConversation {
     body: string
     tool?: unknown
     attachment?: { name?: string; kind?: 'img' | 'pdf' | 'file' | 'fig' } | null
+    attachments?: Array<{ name?: string; kind?: 'img' | 'pdf' | 'file' | 'fig' }> | null
     createdAt: string
     /** Set when last message is an email — used to render "Re: subject"
      *  previews in the sidebar instead of the raw body excerpt. */
@@ -1144,7 +1145,7 @@ export const api = {
   sendMessage: (
     conversationId: string,
     body: string,
-    attachment?: ApiAttachment | null,
+    attachments?: ApiAttachment[] | null,
     quotedMessageId?: string | null,
     /** Optional client-supplied idempotency key (the optimistic bubble's
      *  tempId). The server persists it and returns the original message when
@@ -1155,7 +1156,11 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({
         body,
-        attachment: attachment ?? undefined,
+        // Dual-send: an old server only understands the singular field, so it
+        // gets the first file (degraded, not broken). A new server prefers
+        // `attachments` and dual-writes both columns.
+        attachments: attachments && attachments.length > 0 ? attachments : undefined,
+        attachment: attachments && attachments.length > 0 ? attachments[0] : undefined,
         quotedMessageId: quotedMessageId ?? undefined,
         clientId: clientId ?? undefined,
       }),

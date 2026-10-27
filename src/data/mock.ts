@@ -263,6 +263,32 @@ export const messages: Record<string, Message[]> = {
       ],
     },
     {
+      id: 'm2c2',
+      conversationId: 'aurora',
+      authorId: 'atlas',
+      kind: 'attachment',
+      body: 'Dropping the full research pack — brief, survey raw data, and the teardown screenshots.',
+      at: '13:24',
+      attachments: [
+        {
+          name: 'Aurora · Competitor Brief v2.pdf',
+          meta: '12 pages · 1.4MB',
+          kind: 'pdf',
+        },
+        {
+          name: 'survey-raw.csv',
+          meta: '840 rows · 96KB',
+          kind: 'file',
+          mime: 'text/csv',
+        },
+        {
+          name: 'teardown-01.png',
+          meta: 'screenshot · 420KB',
+          kind: 'img',
+        },
+      ],
+    },
+    {
       id: 'm2d',
       conversationId: 'aurora',
       authorId: 'system',

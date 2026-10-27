@@ -5,7 +5,7 @@ import Markdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import remarkBreaks from 'remark-breaks'
 import { remarkCumora } from '@/lib/remarkCumora'
-import type { Message, Participant } from '@/types'
+import type { ChatAttachment, Message, Participant } from '@/types'
 import { Avatar } from './Avatar'
 import { HumanBadge } from './HumanBadge'
 import { SkypeEmoji } from './SkypeEmoji'
@@ -946,10 +946,9 @@ function ToolCard({ msg }: { msg: Message }) {
   )
 }
 
-function AttachmentCard({ msg }: { msg: Message }) {
+function AttachmentCard({ att }: { att: ChatAttachment }) {
   const [viewerOpen, setViewerOpen] = useState(false)
-  if (!msg.attachment) return null
-  const a = msg.attachment
+  const a = att
 
   // Real image with a URL: render inline; clicking opens the lightbox.
   if (a.kind === 'img' && a.url) {
@@ -1738,7 +1737,10 @@ function MessageRowImpl({ msg, author, delay = 0, animate = true }: MessageRowPr
   const isMine = msg.authorId === meId
 
   const isToolOnly = msg.kind === 'tool' && !msg.body
-  const isAttachOnly = Boolean(msg.attachment) && !msg.body
+  const messageAttachments = msg.attachments?.length
+    ? msg.attachments
+    : (msg.attachment ? [msg.attachment] : [])
+  const isAttachOnly = messageAttachments.length > 0 && !msg.body
   const _isEmail = msg.kind === 'email'
   const isPoll = msg.kind === 'poll'
   // Avatar click opens InfoPane for both kinds — humans now have profile
@@ -1802,7 +1804,9 @@ function MessageRowImpl({ msg, author, delay = 0, animate = true }: MessageRowPr
           ))}
         </div>
       )}
-      {msg.attachment && <AttachmentCard msg={msg} />}
+      {messageAttachments.map((att) => (
+        <AttachmentCard key={att.key ?? att.url ?? att.name} att={att} />
+      ))}
     </>
   )
 

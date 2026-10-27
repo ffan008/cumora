@@ -93,6 +93,9 @@ export interface MessageNewEvent extends TenantTagged {
     reactions?: unknown
     tool?: unknown
     attachment?: unknown
+    /** Full attachment array since schema 0012; `attachment` above keeps the
+     *  first element for legacy consumers. */
+    attachments?: unknown
     /** Echoed verbatim from the POST body when the sender provided one.
      *  The renderer uses it to dedup the WS echo against its still-temp
      *  optimistic bubble when the WS event races the POST response — id

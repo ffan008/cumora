@@ -252,6 +252,7 @@ function fromApi(m: ApiMessage): Message {
   const raw = m as unknown as {
     tool?: Message['tool']
     attachment?: Message['attachment']
+    attachments?: Message['attachments']
     whisperLink?: Message['whisperLink']
     quotedMessageId?: string | null
     quoted?: Message['quoted'] | null
@@ -261,6 +262,11 @@ function fromApi(m: ApiMessage): Message {
     pollTallies?: Message['pollTallies'] | null
     clientId?: string | null
   }
+  // Dual-publish: prefer the schema-0012 array; wrap the legacy singular so
+  // old rows render identically.
+  const attachments = raw.attachments?.length
+    ? raw.attachments
+    : (raw.attachment ? [raw.attachment] : undefined)
   const out: Message = {
     id: m.id,
     conversationId: m.conversationId,
@@ -270,7 +276,8 @@ function fromApi(m: ApiMessage): Message {
     at,
     reactions: deriveMineForReactions(m.reactions),
     tool: raw.tool ?? undefined,
-    attachment: raw.attachment ?? undefined,
+    attachment: attachments?.[0] ?? undefined,
+    attachments,
     whisperLink: raw.whisperLink ?? undefined,
     quotedMessageId: raw.quotedMessageId ?? undefined,
     quoted: raw.quoted ?? undefined,
@@ -676,17 +683,18 @@ function isDefinitiveSendFailure(error: unknown): boolean {
 export async function sendUserMessage(
   convoId: string,
   body: string,
-  attachment?: import('@/api/client').ApiAttachment | null,
+  attachments?: import('@/api/client').ApiAttachment[] | null,
   quotedMessageId?: string | null,
   clientId = newTempId(),
 ): Promise<void> {
   const v = body.trim()
-  if (!v && !attachment) return
+  const files = attachments?.length ? attachments : null
+  if (!v && !files) return
   const meId = getMeId()
   // Without a signed-in user we can't paint an optimistic bubble (no authorId
   // to attribute it to). Fall back to the old fire-and-forget path.
   if (!meId) {
-    try { await api.sendMessage(convoId, v, attachment ?? null, quotedMessageId ?? null) }
+    try { await api.sendMessage(convoId, v, files, quotedMessageId ?? null) }
     catch (err) { console.warn('[messages] send failed', err) }
     return
   }
@@ -720,16 +728,24 @@ export async function sendUserMessage(
     kind: 'text',
     body: v,
     at: timeFromIso(),
-    attachment: attachment
+    attachment: files?.[0]
       ? {
-          name: attachment.name,
-          kind: attachment.kind,
-          url: attachment.url,
-          key: attachment.key,
-          mime: attachment.mime,
-          size: attachment.size,
+          name: files[0].name,
+          kind: files[0].kind,
+          url: files[0].url,
+          key: files[0].key,
+          mime: files[0].mime,
+          size: files[0].size,
         }
       : undefined,
+    attachments: files?.map((a) => ({
+      name: a.name,
+      kind: a.kind,
+      url: a.url,
+      key: a.key,
+      mime: a.mime,
+      size: a.size,
+    })),
     quotedMessageId: quotedMessageId ?? undefined,
     quoted: quotedSummary,
     pending: true,
@@ -756,7 +772,7 @@ export async function sendUserMessage(
   }))
 
   try {
-    const { id: realId } = await api.sendMessage(convoId, v, attachment ?? null, quotedMessageId ?? null, clientId)
+    const { id: realId } = await api.sendMessage(convoId, v, files, quotedMessageId ?? null, clientId)
     // Reconcile the temp bubble with the server. Either the WS `message.new`
     // already raced ahead of us (real id already in the list → drop the temp)
     // or it hasn't (rename temp → real id so the eventual WS event dedupes
@@ -818,14 +834,16 @@ export async function retryFailedMessage(convoId: string, tempId: string): Promi
   const msg = list.find((m) => m.id === tempId)
   if (!msg) return
   const body = msg.body ?? ''
-  const att = msg.attachment
-  const retryAttachment: import('@/api/client').ApiAttachment | null = att
-    ? { url: att.url ?? '', name: att.name, kind: att.kind, key: att.key, mime: att.mime, size: att.size }
-    : null
+  const source = msg.attachments?.length
+    ? msg.attachments
+    : (msg.attachment ? [msg.attachment] : [])
+  const retryAttachments: import('@/api/client').ApiAttachment[] = source
+    .filter((a) => a.url)
+    .map((a) => ({ url: a.url ?? '', name: a.name, kind: a.kind, key: a.key, mime: a.mime, size: a.size }))
   const quotedId = msg.quotedMessageId ?? null
   const clientId = msg.clientId ?? tempId
   discardFailedMessage(convoId, tempId)
-  await sendUserMessage(convoId, body, retryAttachment, quotedId, clientId)
+  await sendUserMessage(convoId, body, retryAttachments, quotedId, clientId)
 }
 
 export async function toggleReaction(messageId: string, emoji: string): Promise<void> {

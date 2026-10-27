@@ -473,6 +473,19 @@ type ComposerDraftState = ComposerDraft
 
 const EMPTY_COMPOSER_DRAFT: ComposerDraftState = EMPTY_DRAFT
 
+/** Mirrors the server's MAX_CHAT_ATTACHMENTS — the composer refuses earlier
+ *  so the user learns about the cap before a wasted upload round-trip. */
+const MAX_CHAT_ATTACHMENTS = 16
+
+/** In-flight upload bookkeeping. Deliberately NOT persisted with the draft:
+ *  an upload cannot resume after a reload, so persisting it would resurrect
+ *  a chip pointing at nothing. Completed files ride the draft itself. */
+interface PendingUpload {
+  localId: string
+  name: string
+  error?: string
+}
+
 function resolveDraftText(next: string | ((prev: string) => string), prev: string) {
   return typeof next === 'function' ? next(prev) : next
 }
@@ -581,7 +594,7 @@ export function Composer({
   // to localStorage, so a reload doesn't lose it either.
   const draftsByScope = useApp((s) => s.composerDrafts)
   const updateDraftInStore = useApp((s) => s.updateComposerDraft)
-  const [uploadingByScope, setUploadingByScope] = useState<Record<string, boolean>>({})
+  const [pendingByScope, setPendingByScope] = useState<Record<string, PendingUpload[]>>({})
   const [uploadErrorsByScope, setUploadErrorsByScope] = useState<Record<string, string>>({})
   const editorRef = useRef<RichInputHandle>(null)
   const fileRef = useRef<HTMLInputElement>(null)
@@ -595,8 +608,9 @@ export function Composer({
 
   const currentDraft = draftsByScope[scopeKey] ?? EMPTY_COMPOSER_DRAFT
   const draft = currentDraft.text
-  const attachment = currentDraft.attachment
-  const uploading = Boolean(uploadingByScope[scopeKey])
+  const attachments = currentDraft.attachments
+  const pendingUploads = pendingByScope[scopeKey] ?? []
+  const uploading = pendingUploads.length > 0
   const uploadError = uploadErrorsByScope[scopeKey] ?? null
 
   // Same signature as before; the empty-draft deletion and the
@@ -616,27 +630,28 @@ export function Composer({
     }))
   }, [scopeKey, updateComposerDraft])
 
-  const setAttachmentForScope = useCallback((targetScope: string, nextAttachment: ApiAttachment | null) => {
+  const setAttachmentsForScope = useCallback((targetScope: string, nextAttachments: ApiAttachment[]) => {
     updateComposerDraft(targetScope, (current) => ({
       ...current,
-      attachment: nextAttachment,
+      // Always a NEW array — applyDraftUpdate identity-compares this field.
+      attachments: nextAttachments,
     }))
   }, [updateComposerDraft])
-
-  const setAttachment = useCallback((nextAttachment: ApiAttachment | null) => {
-    setAttachmentForScope(scopeKey, nextAttachment)
-  }, [scopeKey, setAttachmentForScope])
 
   const clearComposerDraft = useCallback(() => {
     updateComposerDraft(scopeKey, () => EMPTY_COMPOSER_DRAFT)
   }, [scopeKey, updateComposerDraft])
 
-  const setUploadingForScope = useCallback((targetScope: string, nextUploading: boolean) => {
-    setUploadingByScope((prev) => {
-      if (Boolean(prev[targetScope]) === nextUploading) return prev
+  const patchPendingForScope = useCallback((
+    targetScope: string,
+    updater: (prev: PendingUpload[]) => PendingUpload[],
+  ) => {
+    setPendingByScope((prev) => {
+      const next = updater(prev[targetScope] ?? [])
+      if (next.length === 0 && !(targetScope in prev)) return prev
       const copy = { ...prev }
-      if (nextUploading) copy[targetScope] = true
-      else delete copy[targetScope]
+      if (next.length === 0) delete copy[targetScope]
+      else copy[targetScope] = next
       return copy
     })
   }, [])
@@ -759,31 +774,60 @@ export function Composer({
     requestAnimationFrame(() => editorRef.current?.focus())
   }
 
-  const upload = async (file: File, targetScope = scopeKey) => {
-    setUploadingForScope(targetScope, true)
-    setUploadErrorForScope(targetScope, null)
-    try {
-      const a = await api.uploadFile(file)
-      setAttachmentForScope(targetScope, a)
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err)
-      console.warn('[upload] failed', msg)
-      setUploadErrorForScope(targetScope, msg)
-      // Auto-clear after a few seconds so the composer doesn't carry
-      // stale error chrome into the next message.
+  const startUpload = (file: File, targetScope = scopeKey) => {
+    // Count against the cap using whatever this scope currently holds —
+    // completed files live in the draft, in-flight ones in pending state.
+    const completed = (draftsRef.current[targetScope]?.attachments?.length) ?? 0
+    const pendingCount = (pendingByScope[targetScope]?.filter((p) => !p.error).length) ?? 0
+    if (completed + pendingCount >= MAX_CHAT_ATTACHMENTS) {
+      setUploadErrorForScope(targetScope, t('chat.tooManyAttachments', { max: String(MAX_CHAT_ATTACHMENTS) }))
       window.setTimeout(() => setUploadErrorForScope(targetScope, null), 4500)
-    } finally {
-      setUploadingForScope(targetScope, false)
+      return
     }
+    const localId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    patchPendingForScope(targetScope, (prev) => [...prev, { localId, name: file.name }])
+    api.uploadFile(file)
+      .then((a) => {
+        // Append — never replace. The user may have queued several files.
+        updateComposerDraft(targetScope, (current) => ({
+          ...current,
+          attachments: [...current.attachments, a],
+        }))
+      })
+      .catch((err) => {
+        const msg = err instanceof Error ? err.message : String(err)
+        console.warn('[upload] failed', msg)
+        setUploadErrorForScope(targetScope, msg)
+        // Drop the chip and the error chrome after a few seconds so the
+        // composer doesn't carry stale failure state into the next message.
+        window.setTimeout(() => {
+          patchPendingForScope(targetScope, (prev) => prev.filter((p) => p.localId !== localId))
+          setUploadErrorForScope(targetScope, null)
+        }, 4500)
+      })
+      .finally(() => {
+        // Success path: remove the pending chip (the completed one lives in
+        // the draft now). Error path already schedules its own removal above;
+        // removing here too is harmless (filter is idempotent).
+        patchPendingForScope(targetScope, (prev) => prev.filter((p) => p.localId !== localId))
+      })
   }
 
-  const onPickFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const f = e.target.files?.[0]
+  const removeAttachment = (index: number) => {
+    setAttachmentsForScope(scopeKey, attachments.filter((_, i) => i !== index))
+  }
+
+  const removePending = (localId: string) => {
+    patchPendingForScope(scopeKey, (prev) => prev.filter((p) => p.localId !== localId))
+  }
+
+  const onPickFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files ?? [])
     e.target.value = ''
-    if (f) await upload(f)
+    for (const f of files) startUpload(f)
   }
 
-  const onPaste = async (e: React.ClipboardEvent<HTMLDivElement>) => {
+  const onPaste = (e: React.ClipboardEvent<HTMLDivElement>) => {
     const items = e.clipboardData?.items
     if (!items) return
     for (const it of items) {
@@ -793,17 +837,16 @@ export function Composer({
         // unusual outside of clipboard hijack attacks; keep this narrow.
         if (f && f.type.startsWith('image/')) {
           e.preventDefault()
-          await upload(f)
+          startUpload(f)
           return
         }
       }
     }
   }
 
-  const onDrop = async (e: React.DragEvent<HTMLDivElement>) => {
+  const onDrop = (e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault()
-    const f = e.dataTransfer.files?.[0]
-    if (f) await upload(f)
+    for (const f of Array.from(e.dataTransfer.files ?? [])) startUpload(f)
   }
 
   /** Insert raw text at the current caret. Skype shortcodes get a
@@ -906,9 +949,9 @@ export function Composer({
       openPollComposer()
       return
     }
-    if (!v && !attachment) return
+    if (!v && attachments.length === 0) return
     finalizeTyping()
-    sendUserMessage(convoId, v, attachment, replyingToId ?? null)
+    sendUserMessage(convoId, v, attachments, replyingToId ?? null)
     clearComposerDraft()
     editorRef.current?.setValue('')
     if (!isThread) setReplyingTo(convoId, null)
@@ -1007,7 +1050,7 @@ export function Composer({
     requestAnimationFrame(() => editorRef.current?.focus())
   }, [scopeKey])
 
-  const canSend = (draft.trim().length > 0 || attachment !== null) && !uploading
+  const canSend = (draft.trim().length > 0 || attachments.length > 0) && !uploading
 
   return (
     <div className={isThread ? '' : 'px-[22px] pt-1.5 pb-[18px]'}
@@ -1040,27 +1083,51 @@ export function Composer({
         isThread ? 'bg-paper' : 'bg-cloud',
       )}
         style={{ border: '1.5px solid var(--ink-100)' }}>
-        {attachment && (
-          <div className="mb-2 inline-flex items-center gap-2.5 py-1.5 px-2 bg-sky2-50 border border-sky2-100 rounded-lg max-w-full">
-            {attachment.kind === 'img' ? (
-              <img src={attachment.url} alt={attachment.name}
-                className="w-10 h-10 object-cover rounded-md" />
-            ) : (
-              <div className="w-10 h-10 rounded-md grid place-items-center shrink-0"
-                style={{ background: 'linear-gradient(135deg, #2A2A35, #1A1A22)' }}>
-                <IClip className="w-4 h-4 text-white/85" strokeWidth={1.8} />
+        {(attachments.length > 0 || pendingUploads.length > 0) && (
+          <div className="mb-2 flex flex-col gap-1.5">
+            {attachments.map((attachment, i) => (
+              <div key={attachment.key ?? attachment.url ?? `${attachment.name}-${i}`}
+                className="inline-flex items-center gap-2.5 py-1.5 px-2 bg-sky2-50 border border-sky2-100 rounded-lg max-w-full self-start">
+                {attachment.kind === 'img' ? (
+                  <img src={attachment.url} alt={attachment.name}
+                    className="w-10 h-10 object-cover rounded-md" />
+                ) : (
+                  <div className="w-10 h-10 rounded-md grid place-items-center shrink-0"
+                    style={{ background: 'linear-gradient(135deg, #2A2A35, #1A1A22)' }}>
+                    <IClip className="w-4 h-4 text-white/85" strokeWidth={1.8} />
+                  </div>
+                )}
+                <div className="min-w-0">
+                  <div className="text-[12px] font-semibold text-ink-700 truncate max-w-[260px]">{attachment.name}</div>
+                  <div className="text-[10.5px] text-ink-500 truncate">{attachment.mime ?? attachment.kind}{attachment.size ? ` · ${Math.round(attachment.size / 1024)}KB` : ''}</div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => removeAttachment(i)}
+                  className="ml-1 w-6 h-6 rounded-md grid place-items-center text-ink-500 hover:bg-cloud hover:text-ink-900 transition shrink-0"
+                  aria-label={t('chat.removeAttachment')}
+                >×</button>
               </div>
-            )}
-            <div className="min-w-0">
-              <div className="text-[12px] font-semibold text-ink-700 truncate max-w-[260px]">{attachment.name}</div>
-              <div className="text-[10.5px] text-ink-500 truncate">{attachment.mime ?? attachment.kind}{attachment.size ? ` · ${Math.round(attachment.size / 1024)}KB` : ''}</div>
-            </div>
-            <button
-              type="button"
-              onClick={() => setAttachment(null)}
-              className="ml-1 w-6 h-6 rounded-md grid place-items-center text-ink-500 hover:bg-cloud hover:text-ink-900 transition shrink-0"
-              aria-label={t('chat.removeAttachment')}
-            >×</button>
+            ))}
+            {pendingUploads.map((p) => (
+              <div key={p.localId}
+                className="inline-flex items-center gap-2.5 py-1.5 px-2 bg-cloud border border-ink-100 rounded-lg max-w-full self-start">
+                <div className="w-10 h-10 rounded-md grid place-items-center shrink-0"
+                  style={{ background: 'linear-gradient(135deg, #2A2A35, #1A1A22)' }}>
+                  <IClip className="w-4 h-4 text-white/85" strokeWidth={1.8} />
+                </div>
+                <div className="min-w-0">
+                  <div className="text-[12px] font-semibold text-ink-700 truncate max-w-[260px]">{p.name}</div>
+                  <div className="text-[10.5px] text-ink-500 truncate italic">{t('chat.uploading')}</div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => removePending(p.localId)}
+                  className="ml-1 w-6 h-6 rounded-md grid place-items-center text-ink-500 hover:bg-cloud hover:text-ink-900 transition shrink-0"
+                  aria-label={t('chat.removeAttachment')}
+                >×</button>
+              </div>
+            ))}
           </div>
         )}
         {uploading && (
@@ -1235,6 +1302,7 @@ export function Composer({
           <input
             ref={fileRef}
             type="file"
+            multiple
             // No `accept` — let the user pick anything; the server enforces
             // the mime whitelist. Browser-side accept is only a hint anyway
             // (you can still pick any file via drag-drop), so we lean on

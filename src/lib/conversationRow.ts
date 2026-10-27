@@ -40,6 +40,7 @@ export function lastMessageFromWs(m: ApiMessage): NonNullable<ApiConversation['l
     body: m.body,
     tool: m.tool,
     attachment: m.attachment,
+    attachments: m.attachments,
     createdAt: m.createdAt ?? m.at,
     email: m.email
       ? { subject: m.email.subject, direction: m.email.direction, from: m.email.from }

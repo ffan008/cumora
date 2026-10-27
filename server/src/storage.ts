@@ -340,3 +340,79 @@ export async function freshenAttachmentUrl<T extends StoredAttachment | null | u
   if (url === att.url && att.key === key) return att
   return { ...att, url, key } as T
 }
+
+/** Cap on chat attachments per message — mirrors the email attachment cap in
+ *  the router (`MAX_ATTACHMENTS` in `resolveHttpAttachments`). */
+export const MAX_CHAT_ATTACHMENTS = 16
+
+/** The single coalesce rule for reading a message's chat attachments.
+ *  Rows written before migration 0012 carry only the singular `attachment`
+ *  object; newer rows carry the `attachments` array (with `attachment`
+ *  duplicated as its first element for legacy readers). Defensive coercion —
+ *  this data is replayed straight into agent prompts. */
+export function rowAttachments(row: { attachment?: unknown; attachments?: unknown }): StoredAttachment[] {
+  const coerceOne = (value: unknown): StoredAttachment | null => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+    const a = value as Record<string, unknown>
+    if (typeof a.url !== 'string' || typeof a.name !== 'string') return null
+    return a as StoredAttachment
+  }
+  if (Array.isArray(row.attachments)) {
+    return row.attachments.map(coerceOne).filter((a): a is StoredAttachment => a !== null)
+  }
+  const one = coerceOne(row.attachment)
+  return one ? [one] : []
+}
+
+/** Re-sign every attachment's URL from its stored key. Per-element failure
+ *  falls back to the stored URL — one rotten key must not 500 a whole list
+ *  (same rationale as the per-row catch in the GET messages handlers). */
+export async function freshenAttachments(list: StoredAttachment[]): Promise<StoredAttachment[]> {
+  return Promise.all(
+    list.map(async (att) => {
+      try {
+        return await freshenAttachmentUrl(att)
+      } catch {
+        return att
+      }
+    }),
+  )
+}
+
+/** Validate client-supplied chat attachment payloads (singular object or
+ *  array) into storage-resolved `StoredAttachment`s. URLs are display data
+ *  and may be client-controlled or expired — resolve the server-generated
+ *  object key, then mint the URL ourselves so a chat attachment can never
+ *  turn an agent wake into an arbitrary server fetch. Extracted from the
+ *  router so the trust boundary is unit-testable. */
+export async function parseMessageAttachments(
+  raw: unknown,
+): Promise<{ attachments: StoredAttachment[] } | { error: string }> {
+  const items = Array.isArray(raw) ? raw : raw != null ? [raw] : []
+  if (items.length > MAX_CHAT_ATTACHMENTS) {
+    return { error: `too many attachments (${items.length} > ${MAX_CHAT_ATTACHMENTS})` }
+  }
+  const attachments: StoredAttachment[] = []
+  for (const item of items) {
+    if (!item || typeof item !== 'object') continue
+    const a = item as Record<string, unknown>
+    if (typeof a.url !== 'string' || typeof a.name !== 'string') continue
+    const key = messageAttachmentStorageKey(a)
+    if (!key) return { error: 'attachment must reference Cumora storage' }
+    let url: string
+    try {
+      url = await storage.publicUrl(key)
+    } catch {
+      return { error: 'attachment storage reference is invalid' }
+    }
+    attachments.push({
+      url,
+      name: a.name.trim().slice(0, 200),
+      kind: (a.kind === 'pdf' || a.kind === 'file' || a.kind === 'fig' ? a.kind : 'img') as StoredAttachment['kind'],
+      mime: typeof a.mime === 'string' ? a.mime : undefined,
+      size: typeof a.size === 'number' ? a.size : undefined,
+      key,
+    })
+  }
+  return { attachments }
+}

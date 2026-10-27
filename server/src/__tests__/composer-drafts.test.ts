@@ -21,6 +21,7 @@ import {
 } from '../../../src/stores/composerDrafts.js'
 
 const att = { url: 'https://cdn.example/x.pdf', name: 'x.pdf', kind: 'pdf' as const }
+const att2 = { url: 'https://cdn.example/y.csv', name: 'y.csv', kind: 'file' as const, mime: 'text/csv' }
 
 // ── the survival contract ───────────────────────────────────────────────────
 
@@ -40,9 +41,14 @@ test('a thread composer does not share text with its conversation', () => {
 
 test('an attachment rides along with the text', () => {
   // Dropping it would strand a file the user already uploaded.
-  const d = applyDraftUpdate({}, 'c', (c) => ({ ...c, attachment: att }))
-  assert.deepEqual(d.c.attachment, att)
+  const d = applyDraftUpdate({}, 'c', (c) => ({ ...c, attachments: [att] }))
+  assert.deepEqual(d.c.attachments, [att])
   assert.equal(d.c.text, '')
+})
+
+test('several attachments ride along together', () => {
+  const d = applyDraftUpdate({}, 'c', (c) => ({ ...c, attachments: [att, att2] }))
+  assert.deepEqual(d.c.attachments, [att, att2])
 })
 
 // ── emptiness + identity ────────────────────────────────────────────────────
@@ -54,10 +60,10 @@ test('emptying a draft deletes it rather than leaving a tombstone', () => {
   assert.equal('c' in gone, false)
 })
 
-test('clearing text but keeping an attachment keeps the draft', () => {
-  let d = applyDraftUpdate({}, 'c', (c) => ({ text: 'x', attachment: att }))
+test('clearing text but keeping attachments keeps the draft', () => {
+  let d = applyDraftUpdate({}, 'c', (c) => ({ text: 'x', attachments: [att] }))
   d = applyDraftUpdate(d, 'c', (c) => ({ ...c, text: '' }))
-  assert.deepEqual(d.c, { text: '', attachment: att })
+  assert.deepEqual(d.c, { text: '', attachments: [att] })
 })
 
 test('an unchanged update returns the SAME object', () => {
@@ -99,9 +105,16 @@ test('touching an old draft protects it from eviction', () => {
 
 // ── what comes back from storage is not trusted ─────────────────────────────
 
-test('a round trip preserves text and attachment', () => {
-  const d = applyDraftUpdate({}, 'c', () => ({ text: 'hello', attachment: att }))
+test('a round trip preserves text and attachments', () => {
+  const d = applyDraftUpdate({}, 'c', () => ({ text: 'hello', attachments: [att, att2] }))
   assert.deepEqual(parseStoredDrafts(serializeDrafts(d)), d)
+})
+
+test('a legacy singular attachment blob parses as a one-element list', () => {
+  // Drafts persisted before multi-attachment carry `{ attachment }`. A reload
+  // must never evaporate a file the user already uploaded.
+  const raw = JSON.stringify({ c: { text: 'hi', attachment: att } })
+  assert.deepEqual(parseStoredDrafts(raw), { c: { text: 'hi', attachments: [att] } })
 })
 
 test('garbage in storage yields no drafts instead of throwing', () => {
@@ -112,16 +125,17 @@ test('garbage in storage yields no drafts instead of throwing', () => {
 
 test('a malformed attachment is dropped, not replayed into the composer', () => {
   // This value is handed to the send path; a half-parsed one must not survive.
-  const raw = JSON.stringify({ c: { text: 'hi', attachment: { url: 'u' } } })   // no name/kind
-  assert.deepEqual(parseStoredDrafts(raw), { c: { text: 'hi', attachment: null } })
+  const raw = JSON.stringify({ c: { text: 'hi', attachments: [{ url: 'u' }] } })   // no name/kind
+  assert.deepEqual(parseStoredDrafts(raw), { c: { text: 'hi', attachments: [] } })
 })
 
 test('an unknown attachment kind is rejected', () => {
-  const raw = JSON.stringify({ c: { text: 't', attachment: { ...att, kind: 'exe' } } })
-  assert.equal(parseStoredDrafts(raw).c.attachment, null)
+  const raw = JSON.stringify({ c: { text: 't', attachments: [{ ...att, kind: 'exe' }] } })
+  assert.deepEqual(parseStoredDrafts(raw).c.attachments, [])
 })
 
 test('stored entries that decode to empty are not resurrected', () => {
+  assert.deepEqual(parseStoredDrafts(JSON.stringify({ c: { text: '', attachments: [] } })), {})
   assert.deepEqual(parseStoredDrafts(JSON.stringify({ c: { text: '', attachment: null } })), {})
 })
 
@@ -150,7 +164,7 @@ test('evict is a no-op below the cap and preserves identity', () => {
 })
 
 test('isEmptyDraft only calls a draft empty when both halves are', () => {
-  assert.equal(isEmptyDraft({ text: '', attachment: null }), true)
-  assert.equal(isEmptyDraft({ text: ' ', attachment: null }), false)
-  assert.equal(isEmptyDraft({ text: '', attachment: att }), false)
+  assert.equal(isEmptyDraft({ text: '', attachments: [] }), true)
+  assert.equal(isEmptyDraft({ text: ' ', attachments: [] }), false)
+  assert.equal(isEmptyDraft({ text: '', attachments: [att] }), false)
 })

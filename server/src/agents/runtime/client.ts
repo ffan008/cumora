@@ -73,6 +73,9 @@ export interface InboxRow {
   sequence: number
   created_at: string
   attachment: InboxAttachment | null
+  /** Full attachment array since schema 0012. `attachment` above keeps the
+   *  first element for legacy readers; coalesce via `rowAttachments()`. */
+  attachments: InboxAttachment[] | null
   /** Set when this message is a reply: id of the message it quotes. */
   quoted_message_id: string | null
   /** Inline summary of the quoted-original so the agent turn sees both the

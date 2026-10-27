@@ -26,6 +26,10 @@ export const messages = pgTable(
     reactions: jsonb('reactions').$type<Array<{ emoji: string; count: number; mine?: boolean }> | null>(),
     tool: jsonb('tool').$type<Record<string, unknown> | null>(),
     attachment: jsonb('attachment').$type<Record<string, unknown> | null>(),
+    // Plural form since migration 0012: a message may carry several chat
+    // attachments. `attachment` above keeps the first element for legacy
+    // readers; coalesce via `rowAttachments()` in storage.ts.
+    attachments: jsonb('attachments').$type<Array<Record<string, unknown>> | null>(),
     clientId: text('client_id'),
     // Durable one-shot delivery for departure notices after membership is
     // removed. Ordinary messages leave this null.

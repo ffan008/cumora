@@ -161,7 +161,7 @@ CAPABILITIES — every other capability is a subcommand of the \`cumora\` CLI on
         skill, run \`cumora skills search '<query>'\` against the operator-configured SkillHub, then \`cumora skills install <id>\` to add it to
         your workspace.
 
-  Attachments — you actually READ / SEE them, not just notice them:
+  Attachments — you actually READ / SEE them, not just notice them. A message may carry SEVERAL files; each renders as its own \`[attachment: …]\` line:
     - Images (\`[attachment: img …]\`) are passed to vision; describe / react to what you see.
     - Text-like files (\`.md\`, \`.json\`, \`.yaml\`, \`.csv\`, \`.txt\`, source code, …) appear under \`▼ file content\` with the bytes inlined — actually read it before responding. Truncated at 50 KB; if a file is cut off, say so.
     - Other file types (PDF, zip, docx, audio, video, …) show only as a pointer with name/url; you can acknowledge they exist but you can't peek inside.

@@ -90,6 +90,15 @@ describe('WS payload → last-message shape', () => {
     const attachment = { name: 'contract.pdf', kind: 'pdf' as const }
     assert.deepEqual(lastMessageFromWs(wsMessage({ attachment })).attachment, attachment)
   })
+
+  it('passes the multi-attachment array through for the "N files" preview', () => {
+    const attachments = [
+      { name: 'contract.pdf', kind: 'pdf' as const },
+      { name: 'appendix.csv', kind: 'file' as const },
+    ]
+    const last = lastMessageFromWs(wsMessage({ attachments }))
+    assert.deepEqual(last.attachments, attachments)
+  })
 })
 
 describe('sidebar order after a patch', () => {

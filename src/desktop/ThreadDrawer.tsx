@@ -24,11 +24,15 @@ function apiToMessage(m: ApiMessage): Message {
   const raw = m as unknown as {
     tool?: Message['tool']
     attachment?: Message['attachment']
+    attachments?: Message['attachments']
     whisperLink?: Message['whisperLink']
     quotedMessageId?: string | null
     quoted?: Message['quoted'] | null
     replyCount?: number | null
   }
+  const attachments = raw.attachments?.length
+    ? raw.attachments
+    : (raw.attachment ? [raw.attachment] : undefined)
   return {
     id: m.id,
     conversationId: m.conversationId,
@@ -38,7 +42,8 @@ function apiToMessage(m: ApiMessage): Message {
     at: m.at ?? '',
     reactions: m.reactions && m.reactions.length > 0 ? m.reactions : undefined,
     tool: raw.tool ?? undefined,
-    attachment: raw.attachment ?? undefined,
+    attachment: attachments?.[0] ?? undefined,
+    attachments,
     whisperLink: raw.whisperLink ?? undefined,
     quotedMessageId: raw.quotedMessageId ?? undefined,
     quoted: raw.quoted ?? undefined,

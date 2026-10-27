@@ -22,6 +22,7 @@ import { env } from '../env.js'
 import { redis } from '../redis.js'
 import { readLocalMessageAttachment } from '../local-attachment-files.js'
 import { messageAttachmentStorageKey } from '../storage-keys.js'
+import { rowAttachments } from '../storage.js'
 import { classifyInboxTriage, gateSyntheticWake } from './inbox-triage.js'
 import { GLANCE_YIELD_RULES } from './glance-protocol.js'
 import { TOOL_DEFS_RESPONSES, executePodTool } from './runtime/pod-tools.js'
@@ -106,6 +107,8 @@ interface InboxRow {
   sequence: number
   created_at: string
   attachment: InboxAttachment | null
+  /** Full attachment array since schema 0012; coalesce via `rowAttachments()`. */
+  attachments: InboxAttachment[] | null
   /** Set when this message is a reply: the id of the quoted-original. */
   quoted_message_id: string | null
   /** Inlined summary of the quoted-original — saves the agent a second
@@ -560,7 +563,7 @@ function renderContext(
   ctx: ContextRow[],
   unreadCount: number,
   convoCount: number,
-  textExcerpts: Map<string, TextExcerpt> = new Map(),
+  textExcerpts: Map<string, TextExcerpt[]> = new Map(),
   viewerAgentId: string = '',
 ): string {
   if (ctx.length === 0) return '(your inbox is empty)'
@@ -662,8 +665,8 @@ function renderContext(
           .join('  ')
         line += `   ⟨${summary}⟩`
       }
-      if (m.attachment) {
-        const a = m.attachment
+      // One bracket per file so multi-attachment messages read naturally.
+      for (const a of rowAttachments(m)) {
         line += ` [attachment: ${a.kind} "${a.name}" ${a.url}]`
       }
       lines.push(line)
@@ -681,12 +684,16 @@ function renderContext(
       }
       // Inline the text-file content below the message line so the LLM
       // actually READS the file rather than just noting it exists.
-      const excerpt = textExcerpts.get(m.id)
-      if (excerpt) {
-        lines.push(`    ▼ file content (${m.attachment?.name ?? 'attachment'}${excerpt.truncated ? ', truncated' : ''}):`)
-        lines.push(`    \`\`\`${excerpt.lang}`)
-        for (const ln of excerpt.text.split('\n')) lines.push(`    ${ln}`)
-        lines.push('    ```')
+      const excerpts = textExcerpts.get(m.id)
+      if (excerpts && excerpts.length > 0) {
+        for (const excerpt of excerpts) {
+          lines.push(`    ▼ file content (${excerpt.name ?? 'attachment'}${excerpt.truncated ? ', truncated' : ''}):`)
+          lines.push(`    \`\`\`${excerpt.lang}`)
+          for (const ln of excerpt.text.split('\n')) lines.push(`    ${ln}`)
+          lines.push('    ```')
+        }
+        const moreCount = (m.attachments?.length ?? (m.attachment ? 1 : 0)) - excerpts.length
+        if (moreCount > 0) lines.push(`    (${moreCount} more attachment(s) not inlined)`)
       }
     }
     if (!boundaryDrawn) {
@@ -724,7 +731,14 @@ function langFromMime(mime: string, name: string): string {
   return ''
 }
 
-interface TextExcerpt { lang: string; text: string; truncated: boolean }
+interface TextExcerpt { lang: string; text: string; truncated: boolean; name?: string }
+
+/** Budget caps per inbox load — a message may now carry up to 16 attachments
+ *  (MAX_CHAT_ATTACHMENTS); without caps, a burst of text files or images would
+ *  blow the prompt budget and vision cost. Most-recent-first; overflow is
+ *  mentioned in the rendered context ("N more attachment(s) not inlined"). */
+const MAX_TEXT_EXCERPT_FILES = 8
+const MAX_VISION_IMAGES = 8
 
 /** Read a single text-like attachment, returning at most MAX_TEXT_ATTACHMENT_BYTES.
  *  Returns null for non-text mimes or fetch failures — callers fall back to
@@ -769,15 +783,26 @@ async function readTextAttachment(att: InboxAttachment): Promise<TextExcerpt | n
 
 /** Load text excerpts for every text-like attachment in the inbox in
  *  parallel. Returns a Map keyed by message id so renderContext can
- *  inline the content under the matching line. */
-async function loadTextExcerpts(items: InboxRow[]): Promise<Map<string, TextExcerpt>> {
-  const out = new Map<string, TextExcerpt>()
+ *  inline the content under the matching line. Capped at
+ *  MAX_TEXT_EXCERPT_FILES per inbox load (most-recent-first). */
+async function loadTextExcerpts(items: InboxRow[]): Promise<Map<string, TextExcerpt[]>> {
+  const out = new Map<string, TextExcerpt[]>()
   const work: Array<Promise<void>> = []
+  let budget = MAX_TEXT_EXCERPT_FILES
   for (const m of items) {
-    if (!m.attachment) continue
-    work.push(readTextAttachment(m.attachment).then((ex) => {
-      if (ex) out.set(m.id, ex)
-    }))
+    for (const att of rowAttachments(m)) {
+      // Budget only text-like candidates — non-text files can't consume it.
+      const mime = (att.mime ?? '').toLowerCase()
+      if (!mime.startsWith('text/') && !TEXT_LIKE_MIMES.has(mime)) continue
+      if (budget <= 0) break
+      budget--
+      work.push(readTextAttachment(att).then((ex) => {
+        if (!ex) return
+        const list = out.get(m.id) ?? []
+        list.push({ ...ex, name: att.name })
+        out.set(m.id, list)
+      }))
+    }
   }
   await Promise.all(work)
   return out
@@ -785,19 +810,21 @@ async function loadTextExcerpts(items: InboxRow[]): Promise<Map<string, TextExce
 
 /** Pull every image attachment out of the inbox so we can pass them as input_image.
  *  Re-signs URLs just-in-time so OpenAI's fetch from the Worker side doesn't
- *  hit an expired HMAC. */
+ *  hit an expired HMAC. Capped at MAX_VISION_IMAGES per inbox load. */
 async function collectImageAttachments(items: InboxRow[]): Promise<Array<{ messageId: string; url: string; name: string }>> {
   const out: Array<{ messageId: string; url: string; name: string }> = []
   for (const m of items) {
-    const a = m.attachment
-    if (!a || a.kind !== 'img' || !a.url) continue
-    const source = await trustedAttachmentSource(a)
-    if (!source) continue
-    const url = publicUrlFor(source.url)
-    // Only ship images OpenAI can actually fetch. Local /uploads paths without
-    // a PUBLIC_HOST get textually mentioned but not vision-fed.
-    if (!/^https?:\/\//.test(url)) continue
-    out.push({ messageId: m.id, url, name: a.name })
+    for (const a of rowAttachments(m)) {
+      if (out.length >= MAX_VISION_IMAGES) return out
+      if (a.kind !== 'img' || !a.url) continue
+      const source = await trustedAttachmentSource(a)
+      if (!source) continue
+      const url = publicUrlFor(source.url)
+      // Only ship images OpenAI can actually fetch. Local /uploads paths without
+      // a PUBLIC_HOST get textually mentioned but not vision-fed.
+      if (!/^https?:\/\//.test(url)) continue
+      out.push({ messageId: m.id, url, name: a.name })
+    }
   }
   return out
 }
@@ -980,6 +1007,12 @@ function traceInboxMessage(m: InboxRow): Record<string, unknown> {
           url: m.attachment.url,
         }
       : null,
+    attachments: rowAttachments(m).map((a) => ({
+      name: a.name,
+      kind: a.kind,
+      mime: a.mime,
+      url: a.url,
+    })),
     quotedMessageId: m.quoted_message_id,
     quoted: m.quoted
       ? {

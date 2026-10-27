@@ -27,9 +27,9 @@ export interface DraftAttachment {
 
 export interface ComposerDraft {
   text: string
-  /** An upload the user already paid for. Dropping it on navigation loses a
-   *  file that is sitting in storage, so it rides along with the text. */
-  attachment: DraftAttachment | null
+  /** Uploads the user already paid for. Dropping them on navigation loses
+   *  files that are sitting in storage, so they ride along with the text. */
+  attachments: DraftAttachment[]
 }
 
 /** Keyed by composer SCOPE, not conversation: the desktop thread drawer is a
@@ -48,14 +48,14 @@ export const MAX_DRAFTS = 50
  *  for the whole origin; drafts are a guest in it, not the tenant. */
 export const MAX_SERIALIZED_BYTES = 256 * 1024
 
-export const EMPTY_DRAFT: ComposerDraft = { text: '', attachment: null }
+export const EMPTY_DRAFT: ComposerDraft = { text: '', attachments: [] }
 
 export function emptyComposerDraft(): ComposerDraft {
   return EMPTY_DRAFT
 }
 
 export function isEmptyDraft(d: ComposerDraft): boolean {
-  return d.text === '' && d.attachment === null
+  return d.text === '' && d.attachments.length === 0
 }
 
 /** Re-insert a key so it lands at the end of the object's iteration order.
@@ -83,7 +83,9 @@ export function applyDraftUpdate(
 ): ComposerDrafts {
   const current = drafts[scope] ?? EMPTY_DRAFT
   const next = updater(current)
-  if (next.text === current.text && next.attachment === current.attachment) return drafts
+  // Identity checks — updaters must REPLACE the attachments array, never
+  // mutate it in place, or the store can't tell "changed" from "unchanged".
+  if (next.text === current.text && next.attachments === current.attachments) return drafts
   if (isEmptyDraft(next)) {
     if (!(scope in drafts)) return drafts
     const copy = { ...drafts }
@@ -113,10 +115,18 @@ export function parseStoredDrafts(raw: string | null): ComposerDrafts {
   const out: ComposerDrafts = {}
   for (const [scope, value] of Object.entries(parsed as Record<string, unknown>)) {
     if (!scope || typeof value !== 'object' || value === null) continue
-    const v = value as { text?: unknown; attachment?: unknown }
+    const v = value as { text?: unknown; attachment?: unknown; attachments?: unknown }
     const text = typeof v.text === 'string' ? v.text : ''
-    const attachment = parseAttachment(v.attachment)
-    const draft: ComposerDraft = { text, attachment }
+    // Migration: drafts stored before multi-attachment carry a singular
+    // `attachment` object. Wrap it so a reload never evaporates a file the
+    // user already uploaded.
+    const attachments = Array.isArray(v.attachments)
+      ? v.attachments.map(parseAttachment).filter((a): a is DraftAttachment => a !== null)
+      : (() => {
+          const one = parseAttachment(v.attachment)
+          return one ? [one] : []
+        })()
+    const draft: ComposerDraft = { text, attachments }
     if (!isEmptyDraft(draft)) out[scope] = draft
   }
   return evict(out)

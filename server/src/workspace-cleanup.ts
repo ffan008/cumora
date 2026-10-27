@@ -19,6 +19,7 @@ import { env } from './env.js'
 import {
   messageAttachmentStorageKey,
   normalizeStorageKey,
+  rowAttachments,
   storage,
   storageKeyFromPublicUrl,
 } from './storage.js'
@@ -122,10 +123,18 @@ export async function findReferencedStorageKeys(keys: string[], client?: PoolCli
     `SELECT storage_key FROM email_attachments WHERE storage_key = ANY($1::text[])`,
     [uniqueKeys],
   )
-  const messageFiles = await db.query<{ attachment: unknown }>(
-    `SELECT attachment
+  // Match keys referenced by either shape: the legacy singular `attachment`
+  // object or any element of the `attachments` array (schema 0012). The
+  // `->>'key'` projection alone returns NULL for JSON arrays, which would
+  // let GC delete live objects referenced only by attachments[1..].
+  const messageFiles = await db.query<{ attachment: unknown; attachments: unknown }>(
+    `SELECT attachment, attachments
        FROM messages
-      WHERE attachment->>'key' = ANY($1::text[])`,
+      WHERE attachment->>'key' = ANY($1::text[])
+         OR EXISTS (
+           SELECT 1 FROM jsonb_array_elements(COALESCE(attachments, '[]'::jsonb)) e
+            WHERE e->>'key' = ANY($1::text[])
+         )`,
     [uniqueKeys],
   )
   const avatars = await db.query<{ avatar_url: string }>(
@@ -150,9 +159,7 @@ export async function findReferencedStorageKeys(keys: string[], client?: PoolCli
     if (key && uniqueKeys.includes(key)) referenced.add(key)
   }
   for (const row of messageFiles.rows) {
-    const attachments = Array.isArray(row.attachment) ? row.attachment : [row.attachment]
-    for (const attachment of attachments) {
-      if (!attachment || typeof attachment !== 'object') continue
+    for (const attachment of rowAttachments(row)) {
       const key = messageAttachmentStorageKey(attachment as { key?: unknown; url?: unknown })
       if (key && uniqueKeys.includes(key)) referenced.add(key)
     }

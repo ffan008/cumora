@@ -465,19 +465,29 @@ interface AgentInfo {
 
 /** One line's worth of "there is a file on this message".
  *
- *  The attachment already travelled: /inbox selects `m.attachment` and the
- *  daemon received it. It was simply never rendered, so a BYOA agent saw the
- *  text of a message and no sign that a file came with it — and said so, truthfully,
- *  when a user asked why it could not see their zip. The cloud path (turn.ts)
- *  has always surfaced attachments; only this one dropped them.
+ *  The attachment already travelled: /inbox selects `m.attachment` /
+ *  `m.attachments` and the daemon received it. It was simply never rendered,
+ *  so a BYOA agent saw the text of a message and no sign that a file came
+ *  with it — and said so, truthfully, when a user asked why it could not see
+ *  their zip. The cloud path (turn.ts) has always surfaced attachments; only
+ *  this one dropped them.
  *
  *  Name, type and size go inline so the agent can reason about the file, and the
  *  URL follows so it can actually fetch it. Bounded, because this shares the
- *  digest's line budget with the message bodies. */
+ *  digest's line budget with the message bodies. Accepts a single attachment
+ *  (legacy shape) or an array (schema 0012); returns one joined line per file. */
 export function attachmentNote(
-  att: { name?: string; kind?: string; mime?: string; size?: number; url?: string } | null | undefined,
+  att:
+    | { name?: string; kind?: string; mime?: string; size?: number; url?: string }
+    | Array<{ name?: string; kind?: string; mime?: string; size?: number; url?: string }>
+    | null
+    | undefined,
 ): string {
-  if (!att || typeof att !== 'object') return ''
+  if (!att) return ''
+  if (Array.isArray(att)) {
+    return att.map((a) => attachmentNote(a)).filter(Boolean).join('\n')
+  }
+  if (typeof att !== 'object') return ''
   const name = typeof att.name === 'string' && att.name.trim() ? att.name.trim().slice(0, 120) : 'file'
   const type = typeof att.mime === 'string' && att.mime.trim()
     ? att.mime.trim().slice(0, 60)
@@ -505,6 +515,8 @@ interface RuntimeInboxResponse {
     /** Already delivered by /inbox (loadInbox selects m.attachment) and, until
      *  now, dropped on the floor when the digest line was built. */
     attachment?: { name?: string; kind?: string; mime?: string; size?: number; url?: string } | null
+    /** Full attachment array since schema 0012; `attachment` keeps the first. */
+    attachments?: Array<{ name?: string; kind?: string; mime?: string; size?: number; url?: string }> | null
     sequence?: number
   }>
 }
@@ -2624,7 +2636,7 @@ export class AgentRunner {
       // Keep the message id + convo id on each line (like the cloud agent's
       // context) so the engine can QUOTE the exact message: `cumora reply
       // <convo> '<body>' --quote <message_id>`.
-      convo.msgs.push(`  [${row.id}] ${row.conversation_id}  ${who}: ${body}${attachmentNote(row.attachment)}`)
+      convo.msgs.push(`  [${row.id}] ${row.conversation_id}  ${who}: ${body}${attachmentNote(row.attachments ?? row.attachment)}`)
     }
     const projectIds = uniqueProjectIds(
       (inbox?.rows ?? []).map((r) => (typeof r.project_id === 'string' ? r.project_id : null)),

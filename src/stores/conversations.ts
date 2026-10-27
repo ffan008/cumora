@@ -124,18 +124,25 @@ function previewOf(last: ApiConversation['lastMessage']): string {
     // Iris") instead of leaking raw `{"kind":"left",...}` payloads.
     return renderSystemPreview(last.body, resolveName) ?? '(system)'
   }
-  if (last.attachment) {
+  const lastAttachments = last.attachments?.length
+    ? last.attachments
+    : (last.attachment ? [last.attachment] : [])
+  if (lastAttachments.length > 0) {
     // Attachment messages (user uploads) — the row stores attachment
     // metadata in a separate jsonb column and `body` carries only the
     // optional caption. Prefix with a 📎 + filename so the row reads
     // as "shared a file" instead of going blank when the user uploads
-    // without a caption.
-    const a = last.attachment
-    const verb = a.kind === 'img' ? '📷' : '📎'
-    const filename = a.name ?? (a.kind === 'img' ? 'image' : 'file')
-    const label = trimmedBody
-      ? `${verb} ${filename} — ${trimmedBody.slice(0, 80)}`
-      : `${verb} ${filename}`
+    // without a caption. Several files collapse to a count.
+    const label = (() => {
+      if (lastAttachments.length > 1) {
+        const count = `📎 ${lastAttachments.length} files`
+        return trimmedBody ? `${count} — ${trimmedBody.slice(0, 80)}` : count
+      }
+      const a = lastAttachments[0]
+      const verb = a.kind === 'img' ? '📷' : '📎'
+      const filename = a.name ?? (a.kind === 'img' ? 'image' : 'file')
+      return trimmedBody ? `${verb} ${filename} — ${trimmedBody.slice(0, 80)}` : `${verb} ${filename}`
+    })()
     return authorName ? `${authorName}: ${label}` : label
   }
   if (trimmedBody) {

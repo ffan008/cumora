@@ -253,6 +253,20 @@ export interface QuotedSummary {
   sequence: number
 }
 
+export interface ChatAttachment {
+  name: string
+  /** kind 'img' renders inline; others render as a file card */
+  kind: 'img' | 'pdf' | 'file' | 'fig'
+  /** real assets carry a URL; mock/legacy data may not */
+  url?: string
+  /** Storage key used to refresh expiring signed URLs. */
+  key?: string
+  mime?: string
+  size?: number
+  /** legacy descriptor — fallback when no real file is present (e.g. mock data) */
+  meta?: string
+}
+
 export interface Message {
   id: string
   conversationId: string
@@ -269,20 +283,11 @@ export interface Message {
     detail: string
     icon?: 'web' | 'github' | 'figma' | 'db'
   }
-  /** for attachments */
-  attachment?: {
-    name: string
-    /** kind 'img' renders inline; others render as a file card */
-    kind: 'img' | 'pdf' | 'file' | 'fig'
-    /** real assets carry a URL; mock/legacy data may not */
-    url?: string
-    /** Storage key used to refresh expiring signed URLs. */
-    key?: string
-    mime?: string
-    size?: number
-    /** legacy descriptor — fallback when no real file is present (e.g. mock data) */
-    meta?: string
-  }
+  /** for attachments (legacy singular — first element of `attachments`) */
+  attachment?: ChatAttachment
+  /** Full attachment list since schema 0012. `attachment` above is kept as
+   *  the first element for old readers; prefer this field. */
+  attachments?: ChatAttachment[]
   /** for whisper-link cards in main chat */
   whisperLink?: {
     pair: [string, string]

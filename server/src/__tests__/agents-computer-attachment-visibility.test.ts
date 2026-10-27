@@ -57,3 +57,19 @@ test('hostile fields cannot run away with the digest line', () => {
   assert.equal(note.includes('file:///etc/passwd'), false, 'only http(s) urls are surfaced')
   assert.equal(note.includes('NaN'), false)
 })
+
+test('an array of attachments renders one bounded line per file', () => {
+  const note = attachmentNote([
+    { name: 'brief.pdf', kind: 'pdf', mime: 'application/pdf', size: 1400, url: 'https://cdn.cumora.ai/a/1?sig=x' },
+    { name: 'data.csv', kind: 'file', mime: 'text/csv', size: 2048, url: 'https://cdn.cumora.ai/a/2?sig=y' },
+  ])
+  const lines = note.split('\n')
+  assert.equal(lines.length, 2)
+  assert.match(lines[0], /brief\.pdf/)
+  assert.match(lines[1], /data\.csv/)
+  assert.match(note, /https:\/\/cdn\.cumora\.ai\/a\/2\?sig=y/)
+})
+
+test('an empty attachment array renders nothing', () => {
+  assert.equal(attachmentNote([]), '')
+})

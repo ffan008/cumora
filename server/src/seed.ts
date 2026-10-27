@@ -164,12 +164,13 @@ export async function seedIfEmpty(): Promise<void> {
 
     for (const m of SEED_MESSAGES) {
       await client.query(
-        `INSERT INTO messages (id, conversation_id, author_id, kind, body, sequence, reactions, tool, attachment)
-         VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9::jsonb)`,
+        `INSERT INTO messages (id, conversation_id, author_id, kind, body, sequence, reactions, tool, attachment, attachments)
+         VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9::jsonb,$10::jsonb)`,
         [m.id, m.conversationId, m.authorId, m.kind, m.body, m.sequence,
           m.reactions ? JSON.stringify(m.reactions) : null,
           m.tool ? JSON.stringify(m.tool) : null,
           m.attachment ? JSON.stringify(m.attachment) : null,
+          m.attachment ? JSON.stringify([m.attachment]) : null,
         ],
       )
     }

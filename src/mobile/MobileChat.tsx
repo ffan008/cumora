@@ -25,6 +25,14 @@ import { TwEmoji } from '@/components/TwEmoji'
 import { SkypeEmoji } from '@/components/SkypeEmoji'
 import { useT, type MessageKey } from '@/lib/i18n'
 
+/** Mirrors the server's MAX_CHAT_ATTACHMENTS. */
+const MAX_CHAT_ATTACHMENTS = 16
+
+interface PendingUpload {
+  localId: string
+  name: string
+}
+
 export function MobileChat() {
   const t = useT()
   const convoId = useApp((s) => s.selectedConversationId)
@@ -77,8 +85,8 @@ export function MobileChat() {
     if (!convoId) return
     setComposerDraft(convoId, text)
   }, [convoId, setComposerDraft])
-  const [attachment, setAttachment] = useState<ApiAttachment | null>(null)
-  const [uploading, setUploading] = useState(false)
+  const [attachments, setAttachments] = useState<ApiAttachment[]>([])
+  const [pendingUploads, setPendingUploads] = useState<PendingUpload[]>([])
   const [uploadError, setUploadError] = useState<string | null>(null)
   // Per-convo "replying to" pointer, lifted from the global app store so
   // it persists across mounts and matches the desktop composer's UX.
@@ -138,7 +146,8 @@ export function MobileChat() {
   // contenteditable in-gesture and pops the soft keyboard.
   useEffect(() => {
     if (!convoId) return
-    setAttachment(null)
+    setAttachments([])
+    setPendingUploads([])
     setUploadError(null)
     setMention(null)
     setEmojiOpen(false)
@@ -342,23 +351,29 @@ export function MobileChat() {
     setMenuOpen(false)
   }
 
-  const upload = async (file: File) => {
-    setUploading(true); setUploadError(null)
-    try {
-      const a = await api.uploadFile(file)
-      setAttachment(a)
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err)
-      setUploadError(msg)
+  const startUpload = (file: File) => {
+    if (attachments.length + pendingUploads.length >= MAX_CHAT_ATTACHMENTS) {
+      setUploadError(t('mobchat.tooManyAttachments', { max: String(MAX_CHAT_ATTACHMENTS) }))
       window.setTimeout(() => setUploadError(null), 4500)
-    } finally {
-      setUploading(false)
+      return
     }
+    const localId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    setPendingUploads((prev) => [...prev, { localId, name: file.name }])
+    api.uploadFile(file)
+      .then((a) => setAttachments((prev) => [...prev, a]))
+      .catch((err) => {
+        const msg = err instanceof Error ? err.message : String(err)
+        setUploadError(msg)
+        window.setTimeout(() => setUploadError(null), 4500)
+      })
+      .finally(() => {
+        setPendingUploads((prev) => prev.filter((p) => p.localId !== localId))
+      })
   }
-  const onPickFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const f = e.target.files?.[0]
+  const onPickFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files ?? [])
     e.target.value = ''
-    if (f) await upload(f)
+    for (const f of files) startUpload(f)
   }
 
   // Recompute mention state when the draft or caret moves. Mirrors the
@@ -435,12 +450,12 @@ export function MobileChat() {
 
   const send = () => {
     const v = draft.trim()
-    if (!v && !attachment) return
+    if (!v && attachments.length === 0) return
     if (!convoId) return
-    sendUserMessage(convoId, v, attachment, replyingToId ?? null)
+    sendUserMessage(convoId, v, attachments, replyingToId ?? null)
     setDraft('')
     editorRef.current?.setValue('')
-    setAttachment(null)
+    setAttachments([])
     setMention(null)
     setReplyingTo(convoId, null)
     void tapHaptic()
@@ -480,7 +495,7 @@ export function MobileChat() {
       send()
     }
   }
-  const canSend = (draft.trim().length > 0 || attachment !== null) && !uploading
+  const canSend = (draft.trim().length > 0 || attachments.length > 0) && pendingUploads.length === 0
   const memberPs = c.members
     .map((m) => byId[m])
     .filter((p): p is Participant => Boolean(p))
@@ -654,31 +669,52 @@ export function MobileChat() {
         <div className="px-1 pb-1">
           <TypingRow names={typingNames} />
         </div>
-        {attachment && (
-          <div className="mb-2 inline-flex items-center gap-2.5 py-1.5 px-2 bg-sky2-50 border border-sky2-100 rounded-lg max-w-full">
-            {attachment.kind === 'img' ? (
-              <img src={attachment.url} alt={attachment.name}
-                className="w-10 h-10 object-cover rounded-md shrink-0" />
-            ) : (
-              <div className="w-10 h-10 rounded-md grid place-items-center shrink-0"
-                style={{ background: 'linear-gradient(135deg, #2A2A35, #1A1A22)' }}>
-                <IClip className="w-4 h-4 text-white/85" strokeWidth={1.8} />
+        {(attachments.length > 0 || pendingUploads.length > 0) && (
+          <div className="mb-2 flex flex-col gap-1.5">
+            {attachments.map((attachment, i) => (
+              <div key={attachment.key ?? attachment.url ?? `${attachment.name}-${i}`}
+                className="inline-flex items-center gap-2.5 py-1.5 px-2 bg-sky2-50 border border-sky2-100 rounded-lg max-w-full self-start">
+                {attachment.kind === 'img' ? (
+                  <img src={attachment.url} alt={attachment.name}
+                    className="w-10 h-10 object-cover rounded-md shrink-0" />
+                ) : (
+                  <div className="w-10 h-10 rounded-md grid place-items-center shrink-0"
+                    style={{ background: 'linear-gradient(135deg, #2A2A35, #1A1A22)' }}>
+                    <IClip className="w-4 h-4 text-white/85" strokeWidth={1.8} />
+                  </div>
+                )}
+                <div className="min-w-0">
+                  <div className="text-[12px] font-semibold text-ink-700 truncate max-w-[220px]">{attachment.name}</div>
+                  <div className="text-[10.5px] text-ink-500 truncate">{attachment.mime ?? attachment.kind}{attachment.size ? ` · ${Math.round(attachment.size / 1024)}KB` : ''}</div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setAttachments((prev) => prev.filter((_, j) => j !== i))}
+                  className="ml-1 w-6 h-6 rounded-md grid place-items-center text-ink-500 active:bg-cloud transition shrink-0"
+                  aria-label={t('mobchat.removeAttachment')}
+                >×</button>
               </div>
-            )}
-            <div className="min-w-0">
-              <div className="text-[12px] font-semibold text-ink-700 truncate max-w-[220px]">{attachment.name}</div>
-              <div className="text-[10.5px] text-ink-500 truncate">{attachment.mime ?? attachment.kind}{attachment.size ? ` · ${Math.round(attachment.size / 1024)}KB` : ''}</div>
-            </div>
-            <button
-              type="button"
-              onClick={() => setAttachment(null)}
-              className="ml-1 w-6 h-6 rounded-md grid place-items-center text-ink-500 active:bg-cloud transition shrink-0"
-              aria-label={t('mobchat.removeAttachment')}
-            >×</button>
+            ))}
+            {pendingUploads.map((p) => (
+              <div key={p.localId}
+                className="inline-flex items-center gap-2.5 py-1.5 px-2 bg-cloud border border-ink-100 rounded-lg max-w-full self-start">
+                <div className="w-10 h-10 rounded-md grid place-items-center shrink-0"
+                  style={{ background: 'linear-gradient(135deg, #2A2A35, #1A1A22)' }}>
+                  <IClip className="w-4 h-4 text-white/85" strokeWidth={1.8} />
+                </div>
+                <div className="min-w-0">
+                  <div className="text-[12px] font-semibold text-ink-700 truncate max-w-[220px]">{p.name}</div>
+                  <div className="text-[10.5px] text-ink-500 truncate italic">{t('mobchat.uploading')}</div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setPendingUploads((prev) => prev.filter((x) => x.localId !== p.localId))}
+                  className="ml-1 w-6 h-6 rounded-md grid place-items-center text-ink-500 active:bg-cloud transition shrink-0"
+                  aria-label={t('mobchat.removeAttachment')}
+                >×</button>
+              </div>
+            ))}
           </div>
-        )}
-        {uploading && (
-          <div className="mb-2 text-[11.5px] text-ink-500 italic">{t('mobchat.uploading')}</div>
         )}
         {uploadError && (
           <div className="mb-2 text-[11.5px] py-1 px-2 rounded-md text-coral-deep bg-coral-soft inline-block max-w-full truncate">
@@ -767,6 +803,7 @@ export function MobileChat() {
         <input
           ref={fileRef}
           type="file"
+          multiple
           // No `accept` filter — server's MIME whitelist is the source
           // of truth. Browser-side accept is only a hint anyway.
           className="hidden"

@@ -20,17 +20,28 @@ import { pool } from '../../db/pool.js'
 import { CH_MESSAGE_NEW, CH_TYPING, publish, redis } from '../../redis.js'
 import { enqueueBroadcast, nudgeRealtimeOutbox } from '../../realtime-outbox.js'
 import { notifyAlert } from '../../alerting.js'
-import { freshenAttachmentUrl, type StoredAttachment } from '../../storage.js'
+import { freshenAttachmentUrl, freshenAttachments, rowAttachments, type StoredAttachment } from '../../storage.js'
 
 /** Re-sign attachment download URLs just-in-time when loading messages for an
- *  agent turn. The url stored in `messages.attachment` is signed with a TTL
- *  (R2_URL_TTL_SECONDS, default 1h) and goes stale; by the time an agent uses
- *  it — cloud vision fetch, the text-context link, or a BYOA engine opening the
- *  link — the HMAC has expired → 403 → "can't see the image". Re-sign each row's
- *  attachment so every consumer gets a URL valid for a fresh TTL. Best-effort:
- *  freshenAttachmentUrl keeps the stored url on any failure. */
-async function refreshAttachmentUrls(rows: ReadonlyArray<{ attachment?: unknown }>): Promise<void> {
+ *  agent turn. The url stored in `messages.attachment`/`attachments` is signed
+ *  with a TTL (R2_URL_TTL_SECONDS, default 1h) and goes stale; by the time an
+ *  agent uses it — cloud vision fetch, the text-context link, or a BYOA engine
+ *  opening the link — the HMAC has expired → 403 → "can't see the image".
+ *  Re-sign each row's attachments (and the legacy singular copy) so every
+ *  consumer gets URLs valid for a fresh TTL. Best-effort: failures keep the
+ *  stored url. */
+async function refreshAttachmentUrls(
+  rows: ReadonlyArray<{ attachment?: unknown; attachments?: unknown }>,
+): Promise<void> {
   await Promise.all(rows.map(async (r) => {
+    const list = rowAttachments(r)
+    if (list.length === 0 && !r.attachment) return
+    if (list.length > 0) {
+      const fresh = await freshenAttachments(list)
+      ;(r as { attachments?: unknown }).attachments = fresh
+      ;(r as { attachment?: unknown }).attachment = fresh[0] ?? null
+      return
+    }
     const a = r.attachment as StoredAttachment | null | undefined
     if (!a || typeof a !== 'object' || !a.url) return
     try {
@@ -189,7 +200,7 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
           co.conversation_title, co.conversation_kind, co.conversation_topic,
           co.project_id, co.project_name,
           m.author_id, p.kind AS author_kind, COALESCE(p.name, m.author_id) AS author_name,
-          m.body, m.kind, m.sequence, m.created_at, m.attachment, m.quoted_message_id,
+          m.body, m.kind, m.sequence, m.created_at, m.attachment, m.attachments, m.quoted_message_id,
           (
             SELECT jsonb_build_object(
               'id', qm.id, 'authorId', qm.author_id,
@@ -381,7 +392,7 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
        recent AS (
          SELECT
             m.id, m.conversation_id, m.author_id, m.kind, m.body, m.sequence,
-            m.created_at, m.attachment, m.quoted_message_id,
+            m.created_at, m.attachment, m.attachments, m.quoted_message_id,
             c.company_id,
             c.title AS conversation_title, c.kind AS conversation_kind, c.topic AS conversation_topic,
             pr.name AS project_name,
@@ -428,7 +439,7 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
        )
        SELECT id, conversation_id, company_id, conversation_title, conversation_kind, conversation_topic,
               project_name,
-              author_id, author_kind, author_name, body, kind, sequence, created_at, attachment,
+              author_id, author_kind, author_name, body, kind, sequence, created_at, attachment, attachments,
               quoted_message_id, human_last_read_at,
               (
                 SELECT jsonb_build_object(

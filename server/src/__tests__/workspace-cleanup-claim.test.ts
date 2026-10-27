@@ -30,7 +30,12 @@ test('cleanup claims are capped and message references match the key exactly', a
   assert.match(claim, /attempts < \$4/)
   const messages = sql.find((statement) => statement.includes('FROM messages'))
   assert.ok(messages)
+  // Legacy singular column AND the schema-0012 attachments array — the
+  // ->>'key' projection returns NULL for JSON arrays, so without the
+  // jsonb_array_elements clause GC would delete objects referenced only
+  // by attachments[1..].
   assert.match(messages, /attachment->>'key' = ANY/)
+  assert.match(messages, /jsonb_array_elements/)
   assert.doesNotMatch(messages, /LIKE/)
   assert.equal(CLEANUP_MAX_ATTEMPTS, 12)
 })

@@ -11,7 +11,7 @@
 
 import { pool } from '../db/pool.js'
 import type { PoolClient } from 'pg'
-import { storage, freshenAttachmentUrl, type StoredAttachment } from '../storage.js'
+import { storage, freshenAttachmentUrl, freshenAttachments, rowAttachments, type StoredAttachment } from '../storage.js'
 import { env } from '../env.js'
 import type { CliResult, CliSideEffect } from './cli-result.js'
 import { fetchImageBytes } from './image-fetcher.js'
@@ -231,11 +231,27 @@ async function releaseTenantWork(
   })
 }
 
-/** Re-sign one row's attachment from its stored key. Matches the
+/** Re-sign one row's attachments from their stored keys. Matches the
  *  pattern in api/router.ts so a storage hiccup on one row never
  *  fails the whole list — falls back to the stored (possibly stale)
- *  URL with a warning. */
-async function freshenRowAttachment(row: { id: string; attachment: StoredAttachment | null }): Promise<void> {
+ *  URL with a warning. Dual-publishes the legacy singular field. */
+async function freshenRowAttachment(row: {
+  id: string
+  attachment: StoredAttachment | null
+  attachments?: StoredAttachment[] | null
+}): Promise<void> {
+  if (!row.attachment && !row.attachments) return
+  const list = rowAttachments(row)
+  if (list.length > 0) {
+    try {
+      const fresh = await freshenAttachments(list)
+      row.attachments = fresh
+      row.attachment = fresh[0] ?? null
+    } catch (e) {
+      console.warn(`[cli] freshenAttachments failed for message ${row.id}; falling back to stored URLs`, e)
+    }
+    return
+  }
   if (!row.attachment) return
   try {
     row.attachment = await freshenAttachmentUrl(row.attachment)
@@ -244,9 +260,14 @@ async function freshenRowAttachment(row: { id: string; attachment: StoredAttachm
   }
 }
 
-/** One-line, agent-readable summary of an attachment. */
-function renderAttachment(att: StoredAttachment | null | undefined): string | null {
+/** One-line, agent-readable summary per attachment. Accepts the legacy
+ *  singular object or the schema-0012 array. */
+function renderAttachment(att: StoredAttachment | StoredAttachment[] | null | undefined): string | null {
   if (!att) return null
+  if (Array.isArray(att)) {
+    const lines = att.map((a) => renderAttachment(a)).filter((l): l is string => l !== null)
+    return lines.length > 0 ? lines.join('\n') : null
+  }
   const size = typeof att.size === 'number' ? ` ${att.size}B` : ''
   return `    ↳ [${att.kind}] ${att.name}${size} → ${att.url}`
 }
@@ -734,7 +755,7 @@ async function cmdMessages(parsed: ParsedArgs): Promise<CliResult> {
           )
      )
      SELECT
-        m.id, m.author_id, m.kind, m.body, m.sequence, m.created_at, m.attachment, m.poll,
+        m.id, m.author_id, m.kind, m.body, m.sequence, m.created_at, m.attachment, m.attachments, m.poll,
         m.quoted_message_id,
         (
           SELECT jsonb_build_object(
@@ -789,7 +810,7 @@ async function cmdMessages(parsed: ParsedArgs): Promise<CliResult> {
     if (m.kind === 'poll' && m.poll) {
       for (const line of renderPollBlock(m.id, m.poll)) lines.push(line)
     }
-    const att = renderAttachment(m.attachment)
+    const att = renderAttachment(rowAttachments(m))
     if (att) lines.push(att)
   }
   return ok(lines.join('\n'))
@@ -883,7 +904,7 @@ async function cmdSearch(parsed: ParsedArgs): Promise<CliResult> {
     id: string; conversation_id: string; author_id: string; body: string;
     created_at: string; attachment: StoredAttachment | null
   }>(
-    `SELECT m.id, m.conversation_id, m.author_id, m.body, m.created_at, m.attachment
+    `SELECT m.id, m.conversation_id, m.author_id, m.body, m.created_at, m.attachment, m.attachments
        FROM messages m
        JOIN conversations c ON c.id = m.conversation_id
        JOIN participants requester
@@ -910,7 +931,7 @@ async function cmdSearch(parsed: ParsedArgs): Promise<CliResult> {
     const idx = m.body.toLowerCase().indexOf(query.toLowerCase())
     const slice = m.body.slice(Math.max(0, idx - 20), idx + 100).replace(/\n/g, ' \\n ')
     lines.push(`  · [${t}] ${m.conversation_id} ${m.author_id}: …${slice}…`)
-    const att = renderAttachment(m.attachment)
+    const att = renderAttachment(rowAttachments(m))
     if (att) lines.push(att)
   }
   return ok(lines.join('\n'))
@@ -1049,6 +1070,7 @@ async function loadInbox(agentId: string): Promise<InboxItem[]> {
         m.sequence,
         m.created_at,
         m.attachment,
+        m.attachments,
         m.poll,
         m.quoted_message_id,
         (
@@ -1147,7 +1169,7 @@ async function cmdInbox(parsed: ParsedArgs): Promise<CliResult> {
       if (m.kind === 'poll' && m.poll) {
         for (const line of renderPollBlock(m.id, m.poll)) lines.push(line)
       }
-      const att = renderAttachment(m.attachment)
+      const att = renderAttachment(rowAttachments(m))
       if (att) lines.push(att)
     }
     lines.push('')
@@ -2373,9 +2395,9 @@ async function cmdReply(parsed: ParsedArgs): Promise<CliResult> {
       }
     }
     await txClient.query(
-      `INSERT INTO messages (id, conversation_id, author_id, kind, body, sequence, attachment, quoted_message_id, company_id)
-       VALUES ($1,$2,$3,'text',$4,$5,$6::jsonb,$7,$8)`,
-      [messageId, convoId, me, finalBody, sequence, attachment ? JSON.stringify(attachment) : null, resolvedQuotedId, companyId],
+      `INSERT INTO messages (id, conversation_id, author_id, kind, body, sequence, attachment, attachments, quoted_message_id, company_id)
+       VALUES ($1,$2,$3,'text',$4,$5,$6::jsonb,$7::jsonb,$8,$9)`,
+      [messageId, convoId, me, finalBody, sequence, attachment ? JSON.stringify(attachment) : null, attachment ? JSON.stringify([attachment]) : null, resolvedQuotedId, companyId],
     )
     await txClient.query(`UPDATE conversations SET updated_at = NOW() WHERE id = $1`, [convoId])
     await txClient.query(
@@ -2397,6 +2419,7 @@ async function cmdReply(parsed: ParsedArgs): Promise<CliResult> {
         sequence,
         at: new Date().toISOString(),
         attachment: attachment ?? undefined,
+        attachments: attachment ? [attachment] : undefined,
         quotedMessageId: resolvedQuotedId ?? undefined,
         quoted: quotedSummary
           ? {
