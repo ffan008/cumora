@@ -34,6 +34,12 @@ export function MermaidBlock({ code, fallback }: { code: string; fallback: React
 
   useEffect(() => {
     let cancelled = false
+    // Streaming re-renders pass growing code. A previous attempt may have
+    // failed on a truncated diagram — clear both flags so a later complete
+    // code isn't shadowed by the earlier failure (failed is checked first
+    // during render).
+    setSvg(null)
+    setFailed(false)
     void (async () => {
       try {
         const { default: mermaid } = await import('mermaid')
